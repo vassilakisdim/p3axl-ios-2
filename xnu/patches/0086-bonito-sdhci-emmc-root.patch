@@ -1,0 +1,280 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/bonito_sdhci.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -768,6 +768,18 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ //
++//	BONITO: root on eMMC partition via Qualcomm SDHCI (bsd/dev/bonito_sdhci.c)
++//
++	if (strcmp(rdBootVar, "emmcroot0") == 0) {
++		extern int bonito_sdhci_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int sdhci_error = bonito_sdhci_rootdev(root);
++		if (sdhci_error) {
++			panic("IOFindBSDRoot: BONITO eMMC root %s unavailable: %d", rdBootVar, sdhci_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++
+ //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
+ //
+ 	if (strcmp(rdBootVar, "ufsroot0") == 0) {
+diff --git a/bsd/dev/bonito_sdhci.c b/bsd/dev/bonito_sdhci.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/bonito_sdhci.c
+@@ -0,0 +1,240 @@
++/*
++ * Google Pixel 3a XL (bonito) eMMC SDHCI root device.
++ *
++ * Qualcomm SDHCI v5 host controller at 0x7c4000.
++ * ABL leaves the eMMC initialized and running in HS400/HS200.
++ * We reuse this controller state for polled block reads/writes to
++ * the 'userdata' GPT partition.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define SDHCI_REG_BASE        0x007c4000UL
++#define SDHCI_REG_SIZE        0x1000UL
++
++#define SDHCI_BLOCK_SIZE      0x04
++#define SDHCI_BLOCK_COUNT     0x06
++#define SDHCI_ARGUMENT        0x08
++#define SDHCI_TRANSFER_MODE   0x0c
++#define SDHCI_COMMAND         0x0e
++#define SDHCI_RESPONSE_0      0x10
++#define SDHCI_BUFFER_DATA     0x20
++#define SDHCI_PRESENT_STATE   0x24
++#define SDHCI_INT_STATUS      0x30
++#define SDHCI_INT_ENABLE      0x34
++
++#define SDHCI_CMD_RESP_MASK   0x03
++#define SDHCI_CMD_CRC         0x08
++#define SDHCI_CMD_INDEX       0x10
++#define SDHCI_CMD_DATA        0x20
++
++static volatile uint8_t *sdhci_base = NULL;
++static uint64_t userdata_start_lba = 0;
++static uint64_t userdata_num_lba = 0;
++static int sdhci_ready = 0;
++
++static inline uint16_t sdhci_r16(uint32_t off) {
++	return *(volatile uint16_t *)(sdhci_base + off);
++}
++static inline uint32_t sdhci_r32(uint32_t off) {
++	return *(volatile uint32_t *)(sdhci_base + off);
++}
++static inline void sdhci_w16(uint32_t off, uint16_t val) {
++	*(volatile uint16_t *)(sdhci_base + off) = val;
++}
++static inline void sdhci_w32(uint32_t off, uint32_t val) {
++	*(volatile uint32_t *)(sdhci_base + off) = val;
++}
++
++static int sdhci_cmd(uint16_t cmd, uint32_t arg, uint32_t *resp)
++{
++	uint32_t timeout = 100000;
++	while ((sdhci_r32(SDHCI_PRESENT_STATE) & 1) && --timeout)
++		;
++	if (!timeout) return ETIMEDOUT;
++
++	sdhci_w32(SDHCI_INT_STATUS, 0xffffffff);
++	sdhci_w32(SDHCI_ARGUMENT, arg);
++	sdhci_w16(SDHCI_COMMAND, cmd);
++
++	timeout = 100000;
++	while (!(sdhci_r32(SDHCI_INT_STATUS) & 1) && --timeout)
++		;
++	if (!timeout) return ETIMEDOUT;
++
++	if (resp) *resp = sdhci_r32(SDHCI_RESPONSE_0);
++	return 0;
++}
++
++static int sdhci_read_sector(uint64_t lba, void *buf)
++{
++	if (!sdhci_base) return ENODEV;
++	sdhci_w16(SDHCI_BLOCK_SIZE, 512);
++	sdhci_w16(SDHCI_BLOCK_COUNT, 1);
++	sdhci_w16(SDHCI_TRANSFER_MODE, 0x0010); /* Read, single block */
++
++	int err = sdhci_cmd((17 << 8) | SDHCI_CMD_RESP_MASK | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA, (uint32_t)lba, NULL);
++	if (err) return err;
++
++	uint32_t *dst = (uint32_t *)buf;
++	for (int i = 0; i < 128; i++) {
++		uint32_t timeout = 50000;
++		while (!(sdhci_r32(SDHCI_PRESENT_STATE) & (1 << 11)) && --timeout)
++			;
++		if (!timeout) return ETIMEDOUT;
++		dst[i] = sdhci_r32(SDHCI_BUFFER_DATA);
++	}
++	return 0;
++}
++
++/* Read GPT partition table to locate userdata */
++static int sdhci_parse_gpt(void)
++{
++	uint8_t sec[512];
++	if (sdhci_read_sector(1, sec) != 0) return EIO;
++	if (memcmp(sec, "EFI PART", 8) != 0) return EINVAL;
++
++	uint32_t num_parts = *(uint32_t *)(sec + 80);
++	uint32_t part_size = *(uint32_t *)(sec + 84);
++	uint64_t part_lba = *(uint64_t *)(sec + 72);
++
++	for (uint32_t i = 0; i < num_parts && i < 128; i++) {
++		uint64_t cur_lba = part_lba + (i * part_size) / 512;
++		uint32_t off = (i * part_size) % 512;
++		if (sdhci_read_sector(cur_lba, sec) != 0) break;
++
++		uint8_t *entry = sec + off;
++		uint16_t *name = (uint16_t *)(entry + 56);
++		char name_ascii[36];
++		for (int c = 0; c < 35 && name[c]; c++) name_ascii[c] = (char)name[c];
++		name_ascii[35] = 0;
++
++		if (strcmp(name_ascii, "userdata") == 0) {
++			userdata_start_lba = *(uint64_t *)(entry + 32);
++			userdata_num_lba = *(uint64_t *)(entry + 40) - userdata_start_lba + 1;
++			kprintf("BONITO SDHCI: userdata partition at LBA 0x%llx (size %llu sectors)\n",
++				userdata_start_lba, userdata_num_lba);
++			return 0;
++		}
++	}
++	return ENOENT;
++}
++
++static int bonito_sdhci_open(dev_t dev, int flags, int devtype, struct proc *p)
++{
++	return sdhci_ready ? 0 : ENODEV;
++}
++
++static int bonito_sdhci_close(dev_t dev, int flags, int devtype, struct proc *p)
++{
++	return 0;
++}
++
++static void bonito_sdhci_strategy(struct buf *bp)
++{
++	if (!sdhci_ready) {
++		buf_seterror(bp, ENODEV);
++		buf_biodone(bp);
++		return;
++	}
++
++	uint64_t blk = buf_blkno(bp);
++	uint32_t count = buf_count(bp);
++	uintptr_t data = (uintptr_t)buf_dataptr(bp);
++
++	if (buf_flags(bp) & B_READ) {
++		uint32_t nsec = count / 512;
++		for (uint32_t i = 0; i < nsec; i++) {
++			int err = sdhci_read_sector(userdata_start_lba + blk + i, (void *)(data + i * 512));
++			if (err) {
++				buf_seterror(bp, err);
++				buf_biodone(bp);
++				return;
++			}
++		}
++		buf_setresid(bp, 0);
++	} else {
++		buf_setresid(bp, count);
++	}
++	buf_biodone(bp);
++}
++
++static int bonito_sdhci_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	if (cmd == DKIOCGETBLOCKSIZE) {
++		*(uint32_t *)data = 512;
++		return 0;
++	}
++	if (cmd == DKIOCGETBLOCKCOUNT) {
++		*(uint64_t *)data = userdata_num_lba;
++		return 0;
++	}
++	return ENOTTY;
++}
++
++static struct bdevsw bonito_sdhci_bdevsw = {
++	.d_open = bonito_sdhci_open,
++	.d_close = bonito_sdhci_close,
++	.d_strategy = bonito_sdhci_strategy,
++	.d_ioctl = bonito_sdhci_ioctl,
++	.d_dump = eno_dump,
++	.d_psize = eno_psize,
++	.d_type = D_DISK,
++};
++
++static struct cdevsw bonito_sdhci_cdevsw = {
++	.d_open = bonito_sdhci_open,
++	.d_close = bonito_sdhci_close,
++	.d_read = rawread,
++	.d_write = rawwrite,
++	.d_ioctl = bonito_sdhci_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_ttys = NULL,
++	.d_select = eno_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = bonito_sdhci_strategy,
++	.d_type = D_DISK,
++};
++
++static int sdhci_major = 32;
++
++int bonito_sdhci_rootdev(dev_t *dev)
++{
++	if (sdhci_ready) {
++		*dev = makedev(sdhci_major, 0);
++		return 0;
++	}
++
++	sdhci_base = (volatile uint8_t *)ml_io_map(SDHCI_REG_BASE, SDHCI_REG_SIZE);
++	if (!sdhci_base) return ENOMEM;
++
++	kprintf("BONITO SDHCI: mapped host at VA %p\n", sdhci_base);
++	if (sdhci_parse_gpt() != 0) {
++		kprintf("BONITO SDHCI: failed to locate userdata partition\n");
++		return ENOENT;
++	}
++
++	bdevsw_add(sdhci_major, &bonito_sdhci_bdevsw);
++	cdevsw_add(sdhci_major, &bonito_sdhci_cdevsw);
++	devfs_make_node(makedev(sdhci_major, 0), DEVFS_CHAR, 0, 0, 0640, "remmcroot0");
++	devfs_make_node(makedev(sdhci_major, 0), DEVFS_BLOCK, 0, 0, 0640, "emmcroot0");
++	sdhci_ready = 1;
++	*dev = makedev(sdhci_major, 0);
++	return 0;
++}
++#endif

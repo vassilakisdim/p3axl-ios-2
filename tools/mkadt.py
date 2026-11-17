@@ -218,17 +218,21 @@ def build(seed=None, qemu=False, highmem=False, bonito=False):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-width', u32(1080 if bonito else 1125)),
+            ('canvas-height', u32(2160 if bonito else 2436)),
         ])])
 
-    fbcon = node('sweet-fbcon', [
+    fbcon_props = [
         ph(),
         ('reg', u64(FB, fb_size)),
         ('width', u32(fb_w)),
         ('height', u32(fb_h)),
         ('stride', u32(fb_stride)),
-    ])
+    ]
+    if bonito:
+        # Command-mode panel: Snapdragon DPU SDE_CTL0_START triggers display frame update
+        fbcon_props.append(('kickoff-reg', u64(0x0ae0201c)))
+    fbcon = node('sweet-fbcon', fbcon_props)
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
