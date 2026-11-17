@@ -382,6 +382,8 @@ void shim_main(uint64_t dtb)
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
+	for (;;)
+		__asm__ volatile("wfe");
 
 	/* No payload: probe the internal UFS while the MMU is still off. */
 	/* bonito uses eMMC (sdhci@7c4000), skip UFS probe and run MMU/GIC tests */

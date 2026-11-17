@@ -1,7 +1,7 @@
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -717,17 +717,20 @@ extern unsigned char iso_font[256 * 16];
+@@ -717,17 +717,31 @@ extern unsigned char iso_font[256 * 16];
  #define FBCON_FG        0xffffffffu
  #define FBCON_BG        0xff000000u
  
@@ -12,6 +12,19 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 +/* Command-mode panels (Pixel 3a XL bonito, SDM670 SDE_CTL0_START 0x0ae0201c) */
 +volatile uint32_t *fbcon_kickoff = NULL;
 +
++static inline void
++fbcon_px(uint32_t x, uint32_t y, uint32_t c)
++{
++	volatile uint8_t *p = fbcon_base + y * fbcon_stride + x * fbcon_bypp;
++	if (fbcon_bypp == 4) {
++		*(volatile uint32_t *)p = c;
++	} else {
++		p[0] = (uint8_t)c;
++		p[1] = (uint8_t)(c >> 8);
++		p[2] = (uint8_t)(c >> 16);
++	}
++}
++
  static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
  
  static void
@@ -19,13 +32,13 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
  {
  	for (uint32_t y = row * 16 * FBCON_SCALE; y < (row + 1) * 16 * FBCON_SCALE; y++) {
 -		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
-+		volatile uint32_t *line = (volatile uint32_t *)(fbcon_base + y * fbcon_stride);
  		for (uint32_t x = 0; x < fbcon_width; x++) {
- 			line[x] = FBCON_BG;
+-			line[x] = FBCON_BG;
++			fbcon_px(x, y, FBCON_BG);
  		}
  	}
  }
-@@ -739,6 +742,10 @@ fbcon_newline(void)
+@@ -739,6 +753,10 @@ fbcon_newline(void)
  	fbcon_row = (fbcon_row + 1) % fbcon_rows;
  	fbcon_clear_row(fbcon_row);
  	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
@@ -36,7 +49,7 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
  }
  
  static void
-@@ -750,6 +757,10 @@ fbcon_init(void)
+@@ -750,6 +768,10 @@ fbcon_init(void)
  	for (uint32_t r = 0; r < fbcon_rows; r++) {
  		fbcon_clear_row(r);
  	}
@@ -47,16 +60,20 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
  }
  
  static unsigned int
-@@ -776,7 +787,7 @@ fbcon_transmit_data(uint8_t c)
+@@ -776,12 +798,12 @@ fbcon_transmit_data(uint8_t c)
  	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
  	for (uint32_t gy = 0; gy < 16; gy++) {
  		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
 -			volatile uint32_t *line = fbcon_base + (y0 + gy * FBCON_SCALE + sy) * (fbcon_stride / 4) + x0;
-+			volatile uint32_t *line = (volatile uint32_t *)(fbcon_base + (y0 + gy * FBCON_SCALE + sy) * fbcon_stride) + x0;
++			uint32_t y = y0 + gy * FBCON_SCALE + sy;
  			for (uint32_t gx = 0; gx < 8; gx++) {
  				uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
  				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
-@@ -787,6 +798,10 @@ fbcon_transmit_data(uint8_t c)
+-					line[gx * FBCON_SCALE + sx] = px;
++					fbcon_px(x0 + gx * FBCON_SCALE + sx, y, px);
+ 				}
+ 			}
+ 		}
  	}
  	fbcon_col++;
 +	if (fbcon_kickoff != NULL && (c == '\n' || fbcon_col == fbcon_cols - 1)) {
@@ -66,7 +83,16 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
  }
  
  static unsigned int
-@@ -836,6 +851,13 @@ fbcon_probe(void)
+@@ -831,11 +853,22 @@ fbcon_probe(void)
+ 	if (SecureDTGetProperty(entry, "stride", (void const **)&val, &size) == kSuccess) {
+ 		fbcon_stride = *val;
+ 	}
+-	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
++	if (SecureDTGetProperty(entry, "bits-per-pixel", (void const **)&val, &size) == kSuccess &&
++	    (*val == 24 || *val == 32)) {
++		fbcon_bypp = *val / 8;
++	}
++	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * fbcon_bypp) {
  		return;
  	}
  	sweet_early_mark(17, "fbcon config read; mapping");
@@ -84,16 +110,37 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -45,6 +45,8 @@
+@@ -45,6 +45,9 @@
  
  #define SWEET_FB_VSYNC_US   16666
  
 +extern volatile uint32_t *fbcon_kickoff;
++extern uint32_t fbcon_bypp;
 +
  static inline uint32_t get32(const uint8_t *p, size_t off)
  {
  	return *(const uint32_t *)(p + off);
-@@ -290,4 +292,8 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -285,10 +288,24 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++				const uint8_t *src_row = (const uint8_t *)(src + s->offset +
++				    (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
++				if (fbcon_bypp == 3) {
++					uint8_t *dst_row = (uint8_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 3);
++					for (int32_t x = 0; x < w; x++) {
++						dst_row[x * 3 + 0] = src_row[x * 4 + 0];
++						dst_row[x * 3 + 1] = src_row[x * 4 + 1];
++						dst_row[x * 3 + 2] = src_row[x * 4 + 2];
++					}
++				} else {
++					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    src_row, (size_t)w * 4);
++				}
+ 			}
  		}
  		s->release();
  	}

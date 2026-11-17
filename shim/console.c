@@ -25,16 +25,33 @@ static void con_kick_dsi(void)
         __asm__ volatile("dsb sy" ::: "memory");
         *(volatile uint32_t *)SDE_CTL0_START = 1;
         __asm__ volatile("dsb sy" ::: "memory");
+        uint64_t freq, start, now;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(start));
+        uint64_t wait = freq / 50; /* 20 ms for 60Hz command-mode frame transfer */
+        do {
+                __asm__ volatile("mrs %0, cntpct_el0" : "=r"(now));
+        } while ((now - start) < wait);
+#endif
+}
+
+static inline void put_px(int x, int y, uint32_t c)
+{
+#if FB_BPP == 3
+        volatile uint8_t *p = (volatile uint8_t *)con_fb + y * FB_STRIDE + x * 3;
+        p[0] = (uint8_t)c;
+        p[1] = (uint8_t)(c >> 8);
+        p[2] = (uint8_t)(c >> 16);
+#else
+        con_fb[y * (FB_STRIDE / 4) + x] = c;
 #endif
 }
 
 void con_clear(uint32_t bg)
 {
-        for (int y = 0; y < FB_H; y++) {
-                volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
+        for (int y = 0; y < FB_H; y++)
                 for (int x = 0; x < FB_W; x++)
-                        line[x] = bg;
-        }
+                        put_px(x, y, bg);
         con_bg = bg;
         row = 0;
         con_kick_dsi();
@@ -51,12 +68,9 @@ static void put_char(int col, char ch, uint32_t fg)
         for (int gy = 0; gy < 16; gy++)
                 for (int gx = 0; gx < 8; gx++) {
                         uint32_t c = (g[gy] & (0x80 >> gx)) ? fg : con_bg;
-                        for (int sy = 0; sy < SCALE; sy++) {
-                                volatile uint32_t *p = con_fb + (y0 + gy * SCALE + sy) * (FB_STRIDE / 4)
-                                                       + x0 + gx * SCALE;
+                        for (int sy = 0; sy < SCALE; sy++)
                                 for (int sx = 0; sx < SCALE; sx++)
-                                        p[sx] = c;
-                        }
+                                        put_px(x0 + gx * SCALE + sx, y0 + gy * SCALE + sy, c);
                 }
 }
 

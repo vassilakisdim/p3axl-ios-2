@@ -43,7 +43,7 @@ FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # panel and a 36 MiB reservation. The ABL splash stride is not confirmed; the
 # current 4320-byte value is a shim-side candidate and must be checked on-device.
 BONITO_FB_SIZE = 0x2400000
-BONITO_FB_W, BONITO_FB_H, BONITO_FB_STRIDE = 1080, 2160, 1080 * 4
+BONITO_FB_W, BONITO_FB_H, BONITO_FB_STRIDE = 1080, 2160, 1080 * 3
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -230,7 +230,8 @@ def build(seed=None, qemu=False, highmem=False, bonito=False):
         ('stride', u32(fb_stride)),
     ]
     if bonito:
-        # Command-mode panel: Snapdragon DPU SDE_CTL0_START triggers display frame update
+        # Command-mode 24-bpp panel: Snapdragon DPU SDE_CTL0_START triggers display frame update
+        fbcon_props.append(('bits-per-pixel', u32(24)))
         fbcon_props.append(('kickoff-reg', u64(0x0ae0201c)))
     fbcon = node('sweet-fbcon', fbcon_props)
 
