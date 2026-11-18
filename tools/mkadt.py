@@ -28,8 +28,8 @@ HIGH_MEM_SIZE = 0xfcc00000
 # aligned up to 32 MiB. It excludes the lower reserved holes and leaves a
 # 1 MiB panic log at the top. Validate this range against an XNU build before
 # booting; it is not a complete reconstruction of the live memory map.
-BONITO_PHYS_BASE = 0xa2000000
-BONITO_MEM_END = 0x17e2c0000
+BONITO_PHYS_BASE = 0xa6000000
+BONITO_MEM_END = 0xf0000000
 BONITO_MEM_SIZE = BONITO_MEM_END - BONITO_PHYS_BASE
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
@@ -43,7 +43,7 @@ FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # panel and a 36 MiB reservation. The ABL splash stride is not confirmed; the
 # current 4320-byte value is a shim-side candidate and must be checked on-device.
 BONITO_FB_SIZE = 0x2400000
-BONITO_FB_W, BONITO_FB_H, BONITO_FB_STRIDE = 1080, 2160, 1080 * 3
+BONITO_FB_W, BONITO_FB_H, BONITO_FB_STRIDE = 1080, 2160, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -230,8 +230,6 @@ def build(seed=None, qemu=False, highmem=False, bonito=False):
         ('stride', u32(fb_stride)),
     ]
     if bonito:
-        # Command-mode 24-bpp panel: Snapdragon DPU SDE_CTL0_START triggers display frame update
-        fbcon_props.append(('bits-per-pixel', u32(24)))
         fbcon_props.append(('kickoff-reg', u64(0x0ae0201c)))
     fbcon = node('sweet-fbcon', fbcon_props)
 
